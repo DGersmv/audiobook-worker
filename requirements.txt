@@ -3,3 +3,4 @@ requests
 beautifulsoup4
 lxml
 python-docx
+boto3
