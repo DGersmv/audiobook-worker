@@ -21,7 +21,9 @@ except Exception:
     Document = None
 
 S3_ENDPOINT = os.getenv('S3_ENDPOINT', 'https://s3.regru.cloud')
-S3_BUCKET = os.getenv('S3_BUCKET', 'books-storage')
+S3_BUCKET = os.getenv('S3_BUCKET', 'book-storage')
+# If set (same path layout as upload_server: .../jobs/<uuid>/input.<ext>), input is copied from disk instead of S3 download.
+AUDIOBOOK_LOCAL_INPUT_DIR = os.getenv('AUDIOBOOK_LOCAL_INPUT_DIR', '').strip()
 S3_ACCESS_KEY_ID = os.getenv('S3_ACCESS_KEY_ID')
 S3_SECRET_ACCESS_KEY = os.getenv('S3_SECRET_ACCESS_KEY')
 S3_REGION = os.getenv('S3_REGION', 'us-east-1')
@@ -324,6 +326,11 @@ def extract_full_text_html(html_path: str):
 
 
 def download_file(object_key: str, dest_path: str):
+    if AUDIOBOOK_LOCAL_INPUT_DIR:
+        src = os.path.join(AUDIOBOOK_LOCAL_INPUT_DIR, object_key)
+        if os.path.isfile(src):
+            shutil.copy2(src, dest_path)
+            return
     s3_client().download_file(S3_BUCKET, object_key, dest_path)
 
 
