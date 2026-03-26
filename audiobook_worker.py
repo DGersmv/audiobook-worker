@@ -33,6 +33,8 @@ MAX_LEN = int(os.getenv('AUDIOBOOK_MAX_LEN', '3000'))
 CHAPTERS_MIN = int(os.getenv('AUDIOBOOK_CHAPTERS_MIN', '2'))
 SIGNED_EXPIRES_SECONDS = int(os.getenv('AUDIOBOOK_SIGNED_EXPIRES_SECONDS', str(7 * 24 * 60 * 60)))
 POLL_SLEEP_SECONDS = int(os.getenv('AUDIOBOOK_POLL_SLEEP_SECONDS', '8'))
+TTS_TIMEOUT_SECONDS = int(os.getenv('AUDIOBOOK_TTS_TIMEOUT_SECONDS', '90'))
+TTS_RETRIES = int(os.getenv('AUDIOBOOK_TTS_RETRIES', '3'))
 
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
@@ -405,6 +407,17 @@ def rest_update_job(job_id: str, *, status: str, output_zip_path: str | None = N
     r.raise_for_status()
 
 
+def rest_set_progress(job_id: str, message: str):
+    r = requests.patch(
+        rest_url('audiobook_jobs'),
+        headers={**headers_json(), 'Prefer': 'return=minimal'},
+        params={'id': f'eq.{job_id}'},
+        json={'status': 'processing', 'error_message': message[:1000]},
+        timeout=60,
+    )
+    r.raise_for_status()
+
+
 def rest_set_failed(job_id: str, message: str):
     rest_update_job(job_id, status='failed', error_message=message)
 
@@ -426,8 +439,18 @@ def merge_mp3_files(files: list[str], output_file: str):
 
 
 async def tts_to_file(text: str, filename: str):
-    communicate = edge_tts.Communicate(text=text, voice=VOICE)
-    await communicate.save(filename)
+    last_err = None
+    for attempt in range(1, TTS_RETRIES + 1):
+        try:
+            communicate = edge_tts.Communicate(text=text, voice=VOICE)
+            await asyncio.wait_for(communicate.save(filename), timeout=TTS_TIMEOUT_SECONDS)
+            return
+        except Exception as e:
+            last_err = e
+            if attempt >= TTS_RETRIES:
+                break
+            await asyncio.sleep(min(5 * attempt, 15))
+    raise RuntimeError(f'TTS failed after {TTS_RETRIES} attempts: {last_err}')
 
 
 async def synthesize_chapter_mp3(chapter_text: str, out_mp3: str, work_dir: str):
@@ -477,8 +500,11 @@ async def process_job(job: dict):
     output_zip_local = os.path.join(work_dir, f'output_{job_id}.zip')
 
     try:
+        print(f'[job:{job_id}] start', flush=True)
+        rest_set_progress(job_id, 'Подготовка: загружаю исходный файл')
         download_file(input_path, local_input)
 
+        rest_set_progress(job_id, 'Чтение книги и извлечение текста')
         # извлечение текста
         if source_format == 'epub':
             title, full_text = extract_full_text_epub(local_input, work_dir)
@@ -499,18 +525,22 @@ async def process_job(job: dict):
         chapters = split_by_chapters(full_text)
         # ограничение, чтобы не генерить 10000 файлов
         chapters = chapters[:200] if len(chapters) > 200 else chapters
+        rest_set_progress(job_id, f'Начинаю синтез: глав {len(chapters)}')
 
         mp3_dir = os.path.join(work_dir, 'mp3')
         os.makedirs(mp3_dir, exist_ok=True)
 
         chapter_mp3_files = []
         for idx, (ch_title, ch_text) in enumerate(chapters, start=1):
+            if idx == 1 or idx % 3 == 0 or idx == len(chapters):
+                rest_set_progress(job_id, f'Озвучка: глава {idx}/{len(chapters)}')
             chapter_num = f'{idx:02d}'
             mark = sanitize_filename(ch_title, max_len=30)[:30]
             out_mp3 = os.path.join(mp3_dir, f'{book_slug}_{chapter_num}_{mark}.mp3')
             await synthesize_chapter_mp3(ch_text, out_mp3, work_dir)
             chapter_mp3_files.append(out_mp3)
 
+        rest_set_progress(job_id, 'Собираю ZIP')
         # zip
         manifest_path = os.path.join(work_dir, 'manifest.txt')
         with open(manifest_path, 'w', encoding='utf-8') as mf:
@@ -523,10 +553,12 @@ async def process_job(job: dict):
                 z.write(mp3, arcname=os.path.basename(mp3))
 
         output_zip_path = f'jobs/{job_id}/output.zip'
+        rest_set_progress(job_id, 'Загружаю результат в хранилище')
         upload_file(output_zip_path, output_zip_local, 'application/zip')
 
         # signed URL + email
         if RESEND_API_KEY:
+            rest_set_progress(job_id, 'Отправляю письмо на email')
             zip_url = signed_url(output_zip_path)
             subject = f'Аудиокнига: {book_title}'
             html = f"""
@@ -556,9 +588,11 @@ async def process_job(job: dict):
 
         # update job
         rest_update_job(job_id, status='completed', output_zip_path=output_zip_path, error_message=None)
+        print(f'[job:{job_id}] completed', flush=True)
 
     except Exception as e:
         err = str(e)
+        print(f'[job:{job_id}] failed: {err}', flush=True)
         try:
             rest_set_failed(job_id, err[:2000])
         except Exception:
@@ -572,6 +606,7 @@ async def process_job(job: dict):
 
 
 async def main_loop():
+    print('audiobook worker started', flush=True)
     while True:
         try:
             pending_jobs = rest_get_pending(limit=5)
@@ -586,6 +621,7 @@ async def main_loop():
                     continue
 
                 # обрабатываем синхронно, чтобы не утонуть в TTS
+                print(f'[job:{job_id}] claimed', flush=True)
                 await process_job(job)
 
         except Exception as e:
