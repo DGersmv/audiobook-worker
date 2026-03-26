@@ -1,6 +1,9 @@
-﻿edge-tts
+edge-tts
 requests
 beautifulsoup4
 lxml
 python-docx
 boto3
+fastapi
+uvicorn[standard]
+python-multipart
