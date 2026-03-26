@@ -1,14 +1,14 @@
 import os
 import re
-import json
 import time
 import zipfile
 import tempfile
 import shutil
 import asyncio
 import subprocess
-import urllib.parse
 from datetime import datetime, timezone
+import boto3
+from botocore.config import Config
 import requests
 from bs4 import BeautifulSoup
 import edge_tts
@@ -20,7 +20,12 @@ try:
 except Exception:
     Document = None
 
-BUCKET = os.getenv('AUDIOBOOK_BUCKET', 'books')
+S3_ENDPOINT = os.getenv('S3_ENDPOINT', 'https://s3.regru.cloud')
+S3_BUCKET = os.getenv('S3_BUCKET', 'books-storage')
+S3_ACCESS_KEY_ID = os.getenv('S3_ACCESS_KEY_ID')
+S3_SECRET_ACCESS_KEY = os.getenv('S3_SECRET_ACCESS_KEY')
+S3_REGION = os.getenv('S3_REGION', 'us-east-1')
+
 VOICE = os.getenv('AUDIOBOOK_VOICE', 'ru-RU-DmitryNeural')
 MAX_LEN = int(os.getenv('AUDIOBOOK_MAX_LEN', '3000'))
 CHAPTERS_MIN = int(os.getenv('AUDIOBOOK_CHAPTERS_MIN', '2'))
@@ -34,6 +39,19 @@ RESEND_FROM_EMAIL = os.getenv('RESEND_FROM_EMAIL', '227.info <noreply@227.info>'
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars')
+if not S3_ACCESS_KEY_ID or not S3_SECRET_ACCESS_KEY:
+    raise RuntimeError('Missing S3_ACCESS_KEY_ID or S3_SECRET_ACCESS_KEY (Reg.ru S3)')
+
+
+def s3_client():
+    return boto3.client(
+        's3',
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY_ID,
+        aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+        region_name=S3_REGION,
+        config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}),
+    )
 
 
 def now_iso() -> str:
@@ -50,17 +68,6 @@ def headers_json():
 
 def rest_url(path: str) -> str:
     return f'{SUPABASE_URL}/rest/v1/{path}'
-
-
-def storage_object_url(bucket: str, object_key: str) -> str:
-    # В storage API object_key ожидает путь с разделителями /, поэтому encode оставляем со safe='/'.
-    encoded = urllib.parse.quote(object_key, safe='/')
-    return f'{SUPABASE_URL}/storage/v1/object/{bucket}/{encoded}'
-
-
-def storage_sign_url(bucket: str, object_key: str) -> str:
-    encoded = urllib.parse.quote(object_key, safe='/')
-    return f'{SUPABASE_URL}/storage/v1/object/sign/{bucket}/{encoded}'
 
 
 def sanitize_filename(s: str, max_len: int = 90) -> str:
@@ -317,51 +324,24 @@ def extract_full_text_html(html_path: str):
 
 
 def download_file(object_key: str, dest_path: str):
-    url = storage_object_url(BUCKET, object_key)
-    headers = {
-        'apikey': SUPABASE_SERVICE_ROLE_KEY,
-        'Authorization': f'Bearer {SUPABASE_SERVICE_ROLE_KEY}',
-    }
-    r = requests.get(url, headers=headers, stream=True, timeout=600)
-    r.raise_for_status()
-    with open(dest_path, 'wb') as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
+    s3_client().download_file(S3_BUCKET, object_key, dest_path)
 
 
 def upload_file(object_key: str, src_path: str, content_type: str):
-    url = storage_object_url(BUCKET, object_key)
-    headers = {
-        'apikey': SUPABASE_SERVICE_ROLE_KEY,
-        'Authorization': f'Bearer {SUPABASE_SERVICE_ROLE_KEY}',
-        'Content-Type': content_type,
-    }
-    with open(src_path, 'rb') as f:
-        r = requests.post(url, headers=headers, data=f, timeout=600)
-    r.raise_for_status()
-    return r.text
+    s3_client().upload_file(
+        src_path,
+        S3_BUCKET,
+        object_key,
+        ExtraArgs={'ContentType': content_type},
+    )
 
 
 def signed_url(object_key: str, expires_in: int = SIGNED_EXPIRES_SECONDS):
-    url = storage_sign_url(BUCKET, object_key)
-    headers = {
-        'apikey': SUPABASE_SERVICE_ROLE_KEY,
-        'Authorization': f'Bearer {SUPABASE_SERVICE_ROLE_KEY}',
-        'Content-Type': 'application/json',
-    }
-    r = requests.post(url, headers=headers, json={'expiresIn': expires_in}, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-    signed = data.get('signedURL')
-    if not signed:
-        raise RuntimeError(f'No signedURL in response: {data}')
-    if signed.startswith('/'):
-        return f'{SUPABASE_URL}{signed}'
-    # иногда signedURL может быть полным URL
-    if signed.startswith('http'):
-        return signed
-    return signed
+    return s3_client().generate_presigned_url(
+        'get_object',
+        Params={'Bucket': S3_BUCKET, 'Key': object_key},
+        ExpiresIn=expires_in,
+    )
 
 
 def rest_get_pending(limit: int = 1):
