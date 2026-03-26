@@ -333,6 +333,9 @@ def download_file(object_key: str, dest_path: str):
         if os.path.isfile(src):
             shutil.copy2(src, dest_path)
             return
+        # Если настроен локальный ввод, но файла нет — это ошибка конфигурации/пути.
+        # Не делаем fallback в S3, чтобы не получать "HeadObject 404" и не путать.
+        raise RuntimeError(f'Local input not found: {src}')
     s3_client().download_file(S3_BUCKET, object_key, dest_path)
 
 
